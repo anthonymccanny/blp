@@ -1,27 +1,17 @@
-using CSV, DataFrames, Distributions, LinearAlgebra, BenchmarkTools
+using CSV, DataFrames, Distributions, LinearAlgebra, BenchmarkTools, Printf
 
 # Import OTC Data
-data = CSV.read("Courses/IO 1/Problem Set 1/dataps1q3_OTC_Data.csv", DataFrame)
+data = CSV.read("dataps1q3_OTC_Data.csv", DataFrame)
 
 # Import OTC Demographic Data
-income = CSV.read("Courses/IO 1/Problem Set 1/dataps1q3_OTC_Demographic.csv", DataFrame)
+income = CSV.read("dataps1q3_OTC_Demographic.csv", DataFrame)
 
-function market_share(delta, beta_income, beta_brand, price_vec, brand_vec, income, n_draws=10000)
+function market_share(delta, income_effect, brand_effect, price_vec, brand_vec, n_draws=1000)
     n_products = length(delta)
-    
+
     # Pre-allocate arrays
     shares = zeros(n_products)
     utilities = zeros(n_products)
-    
-    # Draw from standard normal for nu
-    nu = randn(n_draws)
-
-    # Draw simulated income distribution from observed income distribution
-    sim_income = @views income[rand(1:end, n_draws)]
-    
-    # Vectorized operations
-    income_effect = beta_income .* sim_income
-    brand_effect = beta_brand .* nu
     
     for r in 1:n_draws
         @. utilities = delta + price_vec * income_effect[r] + brand_vec * brand_effect[r]
@@ -32,7 +22,61 @@ function market_share(delta, beta_income, beta_brand, price_vec, brand_vec, inco
     return shares ./ n_draws
 end
 
-function contraction_mapping_delta(starting_delta, )
+
+function contraction_mapping_delta(starting_delta, market_share_observed, beta_income, beta_brand, price_vec, brand_vec, income)
+    max_iter = 10000
+    tol = 1e-3
+    delta = starting_delta
+
+    # Draw 100 values from a standard normal distribution for each value of income
+    n_draws_per_income = 100
+    nu = randn(length(income) * n_draws_per_income)
+
+    # Repeat each income value 100 times to match the length of nu
+    sim_income = repeat(income, inner=n_draws_per_income)
+
+    # Vectorized operations
+    income_effect = beta_income .* sim_income
+    brand_effect = beta_brand .* nu
+
+    for iter in 1:max_iter
+        # Calculate the predicted market shares
+        predicted_shares = market_share(delta, income_effect, brand_effect, price_vec, brand_vec)
+        
+        # Update delta using the contraction mapping formula
+        delta_new = delta + log.(market_share_observed ./ predicted_shares)
+        
+        # Check for convergence
+        if norm(delta_new - delta) < tol
+            print("YOU DID IT!")
+            return delta_new
+        end
+        println(@sprintf("%.3e", norm(delta_new - delta)))
+
+        # Update delta for the next iteration
+        delta = delta_new
+    end
+    
+    error("Contraction mapping did not converge")
+
+end 
+
+
+
+
+# Call the contraction_mapping_delta function with test parameters
+delta_converged = contraction_mapping_delta(starting_delta_test, market_share_observed_test, beta_income_test, beta_brand_test, price_vec_test, brand_vec_test, income_test)
+
+# Print the test results
+println("Converged Delta:")
+println(delta_converged)
+
+
+
+
+
+
+
 
 # Test the market_share function
 
