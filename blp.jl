@@ -1,4 +1,4 @@
-using CSV, DataFrames, Distributions, LinearAlgebra, BenchmarkTools, Printf
+using CSV, DataFrames, Distributions, LinearAlgebra, BenchmarkTools, Printf, Optim
 
 # Import OTC Data
 data = CSV.read("dataps1q3_OTC_Data.csv", DataFrame)
@@ -17,6 +17,7 @@ store_mapping = Dict(old => new for (new, old) in enumerate(unique_stores))
 data.store = [store_mapping[s] for s in data.store] # Update the store column in the original dataframe
 income.store = [store_mapping[s] for s in income.store] # Update store numbers in income dataframe
 
+
 ## Preprocess market data into a dictionary of matrices
 # We will have to repeatedly access the data for a given market in a given week.
 # As extracting data from a dataframe can be slow, we first put all the data into a format which is easy to access
@@ -27,12 +28,15 @@ market_data = Dict{Tuple{Int64, Int64}, Matrix{Float64}}()
 for group in groupby(data, [:store, :week])
     store = first(group.store)
     week = first(group.week)
-    shares = group[:, :sales] ./ sum(group[:, :sales])
     matrix = Matrix{Float64}(group[:, [:sales, :cost, :branded, :price, :promotion]])
-    shares = group[:, :sales] ./ sum(group[:, :sales]) # Calculate market shares
+    shares = group[:, :sales] ./ group.count # Calculate market shares
     matrix[:, 1] = shares # Replace sales with shares
     market_data[(store, week)] = matrix
 end
+
+# Get the number of unique stores and weeks
+num_stores = length(unique(data.store))
+num_weeks = length(unique(data.week))
 
 # For future reference declare the name of each column in the matrix
 SHARES_COL = 1
@@ -40,6 +44,13 @@ COST_COL = 2
 BRANDED_COL = 3
 PRICE_COL = 4
 PROMOTION_COL = 5
+
+# Draw the simulated nu values for the empirical integral in the inner loop
+# We draw this first in order to make the code more efficient and not have to redraw random variables in each loop
+# Set the number of draws for the nu variable, this should be a multiple of 20 to align with the observed income distributions
+n_draws = 100
+nu = randn(n_draws)
+
 
 ## Preprocess income data into a dictionary of vectors 
 # We will also have to repeatedly access the income distribution for each market-week combo
@@ -59,13 +70,6 @@ for row in eachrow(income)
 end
 
 
-# Draw the simulated nu values for the empirical integral in the inner loop
-# We draw this first in order to make the code more efficient and not have to redraw random variables in each loop
-# Set the number of draws for the nu variable, this should be a multiple of 20 to align with the observed income distributions
-n_draws = 100
-nu = randn(n_draws)
-
-
 ### MARKET SHARE PREDICTION FUNCTION
 # Take the empirical integral of choice probabilities to get predicted market share
 # We average the predicted probability of choosing each product over all our randomly drawn points
@@ -77,7 +81,7 @@ function predicted_market_share(delta, income_effect, brand_effect, price_vec, b
     shares = zeros(n_products)
     utilities = zeros(n_products)
     
-    # For every one of our random draws calculate the utility of each product and then the probabilitiy of choosing each product
+    # For every one of our random draws calculate the utility of each product and then the probability of choosing each product
     # Then add all the probabilities together
     for i in 1:n_draws
         # The @. notation turns operations in this line into vector operations, and can give better performance
@@ -89,14 +93,22 @@ function predicted_market_share(delta, income_effect, brand_effect, price_vec, b
     # Divide the sum of probabilities by the number of random draws to get the empirical integral
     # This is the predicted market share of each product
     # Then return this vector of predicted market shares
+    
+    # Check if any of the shares are not a number (NaN)
+    if any(isnan, shares)
+        # Print the current shares and utilities
+        println("Current shares: ", shares)
+        println("Current utilities: ", utilities)
+        error("Error: Predicted market shares contain NaN values")
+    end
+    
     return shares ./ n_draws
 end
 
 
 function delta_contraction_mapping(market_matrix, income_vector, sigma_income, sigma_brand)
-    max_iter = 1000
+    max_iter = 10000
     tol = 1e-3
-
 
     # Declare the vectors of realized random coefficients from our randomly drawn data
     income_effect = sigma_income .* income_vector
@@ -108,8 +120,13 @@ function delta_contraction_mapping(market_matrix, income_vector, sigma_income, s
 
     # Set a starting value for delta for each product
     delta = zeros(size(market_matrix, 1))
+    delta_new = zeros(size(market_matrix, 1))
+    predicted_shares = zeros(size(market_matrix, 1))
 
     for iter in 1:max_iter
+        # Update delta for the next iteration
+        delta = delta_new
+
         # Calculate the predicted market shares
         predicted_shares = predicted_market_share(delta, income_effect, brand_effect, price_vec, brand_vec)
         
@@ -123,10 +140,12 @@ function delta_contraction_mapping(market_matrix, income_vector, sigma_income, s
         end
         #println(@sprintf("%.3e", norm(delta_new - delta)))
 
-        # Update delta for the next iteration
-        delta = delta_new
     end
     
+    println("Final delta_new: ", delta_new)
+    println("Final delta: ", delta)
+    println("Final norm: ", norm(delta_new - delta))
+    println("Final predicted_shares: ", predicted_shares)
     error("Contraction mapping did not converge")
 
 end 
@@ -166,6 +185,8 @@ function estimate_demand_parameters(sigma_income, sigma_brand)
     beta_intercept = beta[1]
     beta_price = beta[2]
     beta_promotion = beta[3]
+
+    println("Current Beta Intercept: ", beta_intercept, " | Beta Price: ", beta_price, " | Beta Promotion: ", beta_promotion)
     
     return beta_intercept, beta_price, beta_promotion, residuals
 end
@@ -183,23 +204,27 @@ function create_instrument_matrix(market_data)
     Z = zeros(total_observations, num_instruments)
     
     row_index = 1
-    for (market, data) in market_data
-        store, week = market
-        num_products = size(data, 1)
-        
-        # Add wholesale cost as the first instrument
-        Z[row_index:row_index+num_products-1, 1] = data[:, COST_COL]
-        
-        # Add prices from other stores as instruments
-        for i in 1:30
-            other_store = mod1(store + i, 30)  # Wrap around to 1 if exceeds 30
-            if haskey(market_data, (other_store, week))
-                other_data = market_data[(other_store, week)]
-                Z[row_index:row_index+num_products-1, i+1] = other_data[:, PRICE_COL]
+    for store in 1:num_stores
+        for week in 1:num_weeks
+            if haskey(market_data, (store, week))
+                data = market_data[(store, week)]
+                num_products = size(data, 1)
+                
+                # Add wholesale cost as the first instrument
+                Z[row_index:row_index+num_products-1, 1] = data[:, COST_COL]
+                
+                # Add prices from other stores as instruments
+                for i in 1:30
+                    other_store = mod1(store + i, num_stores)  # Wrap around to 1 if exceeds 30
+                    if haskey(market_data, (other_store, week))
+                        other_data = market_data[(other_store, week)]
+                        Z[row_index:row_index+num_products-1, i+1] = other_data[:, PRICE_COL]
+                    end
+                end
+                
+                row_index += num_products
             end
         end
-        
-        row_index += num_products
     end
     
     return Z
@@ -208,11 +233,14 @@ end
 
 function calculate_loss(xi, Z)
     ZZ_inv = inv(Z' * Z)
-    return xi' * Z * ZZ_inv * Z' * xi
+    loss = xi' * Z * ZZ_inv * Z' * xi
+    println("GMM Loss: ", loss)
+    return loss
 end
 
 function gmm_objective(params, market_data, income_data, Z)
     sigma_income, sigma_brand = params
+    println("Evaluating with sigma_income = $(sigma_income), sigma_brand = $(sigma_brand)")
     _, _, _, xi = estimate_demand_parameters(sigma_income, sigma_brand)
     return calculate_loss(xi, Z)
 end
@@ -222,10 +250,15 @@ Z = create_instrument_matrix(market_data)
 
 # Define the optimization problem
 function optimize_gmm()
-    initial_params = [1.0, 1.0]  # Initial guesses for sigma_income and sigma_brand
+    initial_params = [1.0, 1.0]
+    lower_bounds = [-100, -100.0]  # Assuming sigmas should be positive
+    upper_bounds = [100.0, 100.0]  # Set reasonable upper bounds
+    
     result = optimize(params -> gmm_objective(params, market_data, income_data, Z),
+                      lower_bounds,
+                      upper_bounds,
                       initial_params,
-                      BFGS(),
+                      Fminbox(BFGS()),
                       Optim.Options(show_trace = true, iterations = 1000))
     return Optim.minimizer(result)
 end
@@ -241,8 +274,42 @@ println("Final Beta Intercept: ", beta_intercept)
 println("Final Beta Price: ", beta_price)
 println("Final Beta Promotion: ", beta_promotion)
 
+# Walk-through test with specific sigma values
+sigma_income = -1847.096718349596
+sigma_brand = -2935.8221525647355
 
+println("Starting walk-through test with:")
+println("sigma_income = ", sigma_income_test)
+println("sigma_brand = ", sigma_brand_test)
 
+# Call estimate_demand_parameters with these sigma values
+beta_intercept, beta_price, beta_promotion, xi = estimate_demand_parameters(sigma_income_test, sigma_brand_test)
+
+println("\nResults:")
+println("Beta Intercept: ", beta_intercept)
+println("Beta Price: ", beta_price)
+println("Beta Promotion: ", beta_promotion)
+
+# Calculate and print the GMM objective function value
+Z = create_instrument_matrix(market_data)
+gmm_loss = calculate_loss(xi, Z)
+println("GMM Objective Function Value: ", gmm_loss)
+
+# Print a sample of xi values
+println("\nSample of xi values:")
+println(xi[1:min(10, length(xi))])  # Print first 10 values or less if xi is shorter
+
+# Additional diagnostics
+println("\nDiagnostics:")
+println("Mean of xi: ", mean(xi))
+println("Standard deviation of xi: ", std(xi))
+println("Min of xi: ", minimum(xi))
+println("Max of xi: ", maximum(xi))
+
+# You might want to add more specific checks or diagnostics here
+# For example, you could check if any values are unexpectedly large or small
+
+Evaluating with sigma_income = -1847.096718349596, sigma_brand = -2935.8221525647355
 
 
 
