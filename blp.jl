@@ -6,25 +6,88 @@ data = CSV.read("dataps1q3_OTC_Data.csv", DataFrame)
 # Import OTC Demographic Data
 income = CSV.read("dataps1q3_OTC_Demographic.csv", DataFrame)
 
-function market_share(delta, income_effect, brand_effect, price_vec, brand_vec, n_draws=1000)
+### PREPARE DATA
+
+## Renumber stores
+# The stores are not numbered consecutively in the data, to make things a little easier we renumber the stores from 1 to 73
+
+# First, create a mapping of old store numbers to new store numbers
+unique_stores = sort(unique(data.store))
+store_mapping = Dict(old => new for (new, old) in enumerate(unique_stores))
+data.store = [store_mapping[s] for s in data.store] # Update the store column in the original dataframe
+income.store = [store_mapping[s] for s in income.store] # Update store numbers in income dataframe
+
+## Preprocess market data into a dictionary of matrices
+# We will have to repeatedly access the data for a given market in a given week.
+# As extracting data from a dataframe can be slow, we first put all the data into a format which is easy to access
+# We store the data for each market-week in a matrix (useful for multiplying later) and index it by a tuple for store and week
+
+market_data = Dict{Tuple{Int64, Int64}, Matrix{Float64}}()
+
+for group in groupby(data, [:store, :week])
+    old_store = first(group.store)
+    new_store = store_mapping[old_store]
+    week = first(group.week)
+    matrix = Matrix{Float64}(group[:, [:sales, :cost, :branded, :price, :promotion]])
+    market_data[(new_store, week)] = matrix
+end
+
+## Preprocess income data into a dictionary of vectors 
+# We will also have to repeatedly access the income distribution for each market-week combo
+# Also, we need to create a vector that repeats the income values enough time to match our total number of random draws for our empirical integral
+# To make the code efficient, we create these vectors first and store them in a dictionary for easy recall
+income_data = Dict{Tuple{Int64, Int64}, Vector{Float64}}()
+
+n_income_values = 20  # Number of income variables in the demographic data
+n_repeats = div(n_draws, n_income_values)  # Number of times to repeat each income value
+
+for row in eachrow(income)
+    store = row.store
+    week = row.week
+    income_values = Vector{Float64}(row[3:end])
+    repeated_income = repeat(income_values, inner=n_repeats)
+    income_data[(store, week)] = repeated_income
+end
+
+
+# Draw the simulated nu values for the empirical integral in the inner loop
+# We draw this first in order to make the code more efficient and not have to redraw random variables in each loop
+# Set the number of draws for the nu variable, this should be a multiple of 20 to align with the observed income distributions
+n_draws = 100
+nu = randn(n_draws)
+
+
+
+
+### MARKET SHARE PREDICTION FUNCTION
+# Take the empirical integral of choice probabilities to get predicted market share
+# We average the predicted probability of choosing each product over all our randomly drawn points
+    
+function predicted_market_share(delta, income_effect, brand_effect, price_vec, brand_vec)
     n_products = length(delta)
 
-    # Pre-allocate arrays
+    # Create the initial vectors. `shares` and `utilities` are vectors the same length as the number of products
     shares = zeros(n_products)
     utilities = zeros(n_products)
     
-    for r in 1:n_draws
-        @. utilities = delta + price_vec * income_effect[r] + brand_vec * brand_effect[r]
-        denominator = 1 + sum(exp, utilities)
+    # For every one of our random draws calculate the utility of each product and then the probabilitiy of choosing each product
+    # Then add all the probabilities together
+    for i in 1:n_draws
+        # The @. notation turns operations in this line into vector operations, and can give better performance
+        @. utilities = delta + price_vec * income_effect[i] + brand_vec * brand_effect[i]
+        denominator = 1 + sum(exp.(utilities))
         @. shares += exp(utilities) / denominator
     end
     
+    # Divide the sum of probabilities by the number of random draws to get the empirical integral
+    # This is the predicted market share of each product
+    # Then return this vector of predicted market shares
     return shares ./ n_draws
 end
 
 
-function contraction_mapping_delta(starting_delta, market_share_observed, beta_income, beta_brand, price_vec, brand_vec, income)
-    max_iter = 10000
+function contraction_mapping_delta(starting_delta, market_share_observed, sigma_income, sigma_brand, price_vec, brand_vec, income)
+    max_iter = 1000
     tol = 1e-3
     delta = starting_delta
 
@@ -36,8 +99,8 @@ function contraction_mapping_delta(starting_delta, market_share_observed, beta_i
     sim_income = repeat(income, inner=n_draws_per_income)
 
     # Vectorized operations
-    income_effect = beta_income .* sim_income
-    brand_effect = beta_brand .* nu
+    income_effect = sigma_income .* sim_income
+    brand_effect = sigma_brand .* nu
 
     for iter in 1:max_iter
         # Calculate the predicted market shares
