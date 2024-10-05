@@ -25,12 +25,21 @@ income.store = [store_mapping[s] for s in income.store] # Update store numbers i
 market_data = Dict{Tuple{Int64, Int64}, Matrix{Float64}}()
 
 for group in groupby(data, [:store, :week])
-    old_store = first(group.store)
-    new_store = store_mapping[old_store]
+    store = first(group.store)
     week = first(group.week)
+    shares = group[:, :sales] ./ sum(group[:, :sales])
     matrix = Matrix{Float64}(group[:, [:sales, :cost, :branded, :price, :promotion]])
-    market_data[(new_store, week)] = matrix
+    shares = group[:, :sales] ./ sum(group[:, :sales]) # Calculate market shares
+    matrix[:, 1] = shares # Replace sales with shares
+    market_data[(store, week)] = matrix
 end
+
+# For future reference declare the name of each column in the matrix
+SHARES_COL = 1
+COST_COL = 2
+BRANDED_COL = 3
+PRICE_COL = 4
+PROMOTION_COL = 5
 
 ## Preprocess income data into a dictionary of vectors 
 # We will also have to repeatedly access the income distribution for each market-week combo
@@ -55,8 +64,6 @@ end
 # Set the number of draws for the nu variable, this should be a multiple of 20 to align with the observed income distributions
 n_draws = 100
 nu = randn(n_draws)
-
-
 
 
 ### MARKET SHARE PREDICTION FUNCTION
@@ -86,35 +93,35 @@ function predicted_market_share(delta, income_effect, brand_effect, price_vec, b
 end
 
 
-function contraction_mapping_delta(starting_delta, market_share_observed, sigma_income, sigma_brand, price_vec, brand_vec, income)
+function delta_contraction_mapping(market_matrix, income_vector, sigma_income, sigma_brand)
     max_iter = 1000
     tol = 1e-3
-    delta = starting_delta
 
-    # Draw 100 values from a standard normal distribution for each value of income
-    n_draws_per_income = 100
-    nu = randn(length(income) * n_draws_per_income)
 
-    # Repeat each income value 100 times to match the length of nu
-    sim_income = repeat(income, inner=n_draws_per_income)
-
-    # Vectorized operations
-    income_effect = sigma_income .* sim_income
+    # Declare the vectors of realized random coefficients from our randomly drawn data
+    income_effect = sigma_income .* income_vector
     brand_effect = sigma_brand .* nu
+
+    # Get the price and branded information about products for this market
+    price_vec = market_matrix[:, PRICE_COL]
+    brand_vec = market_matrix[:, BRANDED_COL]
+
+    # Set a starting value for delta for each product
+    delta = zeros(size(market_matrix, 1))
 
     for iter in 1:max_iter
         # Calculate the predicted market shares
-        predicted_shares = market_share(delta, income_effect, brand_effect, price_vec, brand_vec)
+        predicted_shares = predicted_market_share(delta, income_effect, brand_effect, price_vec, brand_vec)
         
         # Update delta using the contraction mapping formula
-        delta_new = delta + log.(market_share_observed ./ predicted_shares)
+        delta_new = delta + log.(market_matrix[:, SHARES_COL] ./ predicted_shares)
         
         # Check for convergence
         if norm(delta_new - delta) < tol
-            print("YOU DID IT!")
+            #print("YOU DID IT!")
             return delta_new
         end
-        println(@sprintf("%.3e", norm(delta_new - delta)))
+        #println(@sprintf("%.3e", norm(delta_new - delta)))
 
         # Update delta for the next iteration
         delta = delta_new
@@ -123,6 +130,120 @@ function contraction_mapping_delta(starting_delta, market_share_observed, sigma_
     error("Contraction mapping did not converge")
 
 end 
+
+
+function estimate_demand_parameters(sigma_income, sigma_brand)
+    all_deltas = Float64[]
+    all_prices = Float64[]
+    all_promotions = Float64[]
+    
+    for store in 1:num_stores
+        for week in 1:num_weeks
+            data = market_data[(store, week)]
+            income_vector = income_data[(store, week)]
+            
+            # Run contraction mapping
+            delta_converged = delta_contraction_mapping(data, income_vector, sigma_income, sigma_brand)
+            
+            # Append results
+            append!(all_deltas, delta_converged)
+            append!(all_prices, data[:, PRICE_COL])
+            append!(all_promotions, data[:, PROMOTION_COL])
+        end
+    end
+    
+    # Prepare data for regression
+    X = hcat(ones(length(all_prices)), all_prices, all_promotions)
+    y = all_deltas
+    
+    # Run OLS regression
+    beta = inv(X' * X) * X' * y
+    
+    # Calculate residuals
+    residuals = y - X * beta
+    
+    # Extract coefficients
+    beta_intercept = beta[1]
+    beta_price = beta[2]
+    beta_promotion = beta[3]
+    
+    return beta_intercept, beta_price, beta_promotion, residuals
+end
+
+# Example usage:
+beta_intercept, beta_price, beta_promotion, xi = estimate_demand_parameters(1, 1)
+println("Beta Price: ", beta_price)
+println("Beta Promotion: ", beta_promotion)
+println("Number of residuals: ", length(xi))
+
+
+function create_instrument_matrix(market_data)
+    num_instruments = 31  # 1 for wholesale cost, 30 for other store prices
+    total_observations = sum(size(data, 1) for (_, data) in market_data)
+    Z = zeros(total_observations, num_instruments)
+    
+    row_index = 1
+    for (market, data) in market_data
+        store, week = market
+        num_products = size(data, 1)
+        
+        # Add wholesale cost as the first instrument
+        Z[row_index:row_index+num_products-1, 1] = data[:, COST_COL]
+        
+        # Add prices from other stores as instruments
+        for i in 1:30
+            other_store = mod1(store + i, 30)  # Wrap around to 1 if exceeds 30
+            if haskey(market_data, (other_store, week))
+                other_data = market_data[(other_store, week)]
+                Z[row_index:row_index+num_products-1, i+1] = other_data[:, PRICE_COL]
+            end
+        end
+        
+        row_index += num_products
+    end
+    
+    return Z
+
+end
+
+function calculate_loss(xi, Z)
+    ZZ_inv = inv(Z' * Z)
+    return xi' * Z * ZZ_inv * Z' * xi
+end
+
+function gmm_objective(params, market_data, income_data, Z)
+    sigma_income, sigma_brand = params
+    _, _, _, xi = estimate_demand_parameters(sigma_income, sigma_brand)
+    return calculate_loss(xi, Z)
+end
+
+# Create instrument matrix
+Z = create_instrument_matrix(market_data)
+
+# Define the optimization problem
+function optimize_gmm()
+    initial_params = [1.0, 1.0]  # Initial guesses for sigma_income and sigma_brand
+    result = optimize(params -> gmm_objective(params, market_data, income_data, Z),
+                      initial_params,
+                      BFGS(),
+                      Optim.Options(show_trace = true, iterations = 1000))
+    return Optim.minimizer(result)
+end
+
+# Run the optimization
+optimal_params = optimize_gmm()
+println("Optimal sigma_income: ", optimal_params[1])
+println("Optimal sigma_brand: ", optimal_params[2])
+
+# Calculate final estimates using optimal parameters
+beta_intercept, beta_price, beta_promotion, xi = estimate_demand_parameters(optimal_params[1], optimal_params[2])
+println("Final Beta Intercept: ", beta_intercept)
+println("Final Beta Price: ", beta_price)
+println("Final Beta Promotion: ", beta_promotion)
+
+
+
+
 
 
 
