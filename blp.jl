@@ -263,8 +263,19 @@ function optimize_gmm()
     return Optim.minimizer(result)
 end
 
+function optimize_gmm_nm()
+    initial_params = [1.0, 1.0]
+    
+    result = optimize(params -> gmm_objective(params, market_data, income_data, Z),
+                      initial_params,
+                      NelderMead(),
+                      Optim.Options(show_trace = true, iterations = 1000))
+    return Optim.minimizer(result)
+end
+
+
 # Run the optimization
-optimal_params = optimize_gmm()
+optimal_params = optimize_gmm_nm()
 println("Optimal sigma_income: ", optimal_params[1])
 println("Optimal sigma_brand: ", optimal_params[2])
 
@@ -273,146 +284,3 @@ beta_intercept, beta_price, beta_promotion, xi = estimate_demand_parameters(opti
 println("Final Beta Intercept: ", beta_intercept)
 println("Final Beta Price: ", beta_price)
 println("Final Beta Promotion: ", beta_promotion)
-
-# Walk-through test with specific sigma values
-sigma_income = -1847.096718349596
-sigma_brand = -2935.8221525647355
-
-println("Starting walk-through test with:")
-println("sigma_income = ", sigma_income_test)
-println("sigma_brand = ", sigma_brand_test)
-
-# Call estimate_demand_parameters with these sigma values
-beta_intercept, beta_price, beta_promotion, xi = estimate_demand_parameters(sigma_income_test, sigma_brand_test)
-
-println("\nResults:")
-println("Beta Intercept: ", beta_intercept)
-println("Beta Price: ", beta_price)
-println("Beta Promotion: ", beta_promotion)
-
-# Calculate and print the GMM objective function value
-Z = create_instrument_matrix(market_data)
-gmm_loss = calculate_loss(xi, Z)
-println("GMM Objective Function Value: ", gmm_loss)
-
-# Print a sample of xi values
-println("\nSample of xi values:")
-println(xi[1:min(10, length(xi))])  # Print first 10 values or less if xi is shorter
-
-# Additional diagnostics
-println("\nDiagnostics:")
-println("Mean of xi: ", mean(xi))
-println("Standard deviation of xi: ", std(xi))
-println("Min of xi: ", minimum(xi))
-println("Max of xi: ", maximum(xi))
-
-# You might want to add more specific checks or diagnostics here
-# For example, you could check if any values are unexpectedly large or small
-
-Evaluating with sigma_income = -1847.096718349596, sigma_brand = -2935.8221525647355
-
-
-
-
-
-# Call the contraction_mapping_delta function with test parameters
-delta_converged = contraction_mapping_delta(starting_delta_test, market_share_observed_test, beta_income_test, beta_brand_test, price_vec_test, brand_vec_test, income_test)
-
-# Print the test results
-println("Converged Delta:")
-println(delta_converged)
-
-
-
-
-
-
-
-
-# Test the market_share function
-
-# Define test parameters
-delta_test = [1.0, 2.0, 3.0]
-beta_income_test = 0.5
-beta_brand_test = 0.3
-price_vec_test = [1.0, 1.5, 2.0]
-brand_vec_test = [0.0, 1.0, 0.0]
-
-# Use a subset of the income data for testing
-income_test = 1:10
-
-# Benchmark the market_share function
-benchmark = @benchmark market_share($delta_test, $beta_income_test, $beta_brand_test, $price_vec_test, $brand_vec_test, $income_test)
-
-# Print the benchmark results
-println("Benchmark results:")
-display(benchmark)
-
-# Call the market_share function with test parameters
-shares_test = market_share(delta_test, beta_income_test, beta_brand_test, price_vec_test, brand_vec_test, income_test)
-
-# Print the test results
-println("Test Market Shares:")
-println(shares_test)
-
-# Benchmark the optimized function
-benchmark_optimized = @benchmark market_share_optimized($delta_test, $beta_income_test, $beta_brand_test, $price_vec_test, $brand_vec_test, $income_test)
-
-println("\nBenchmark results for optimized function:")
-display(benchmark_optimized)
-
-# Test the optimized function and print results
-shares_test_optimized = market_share_optimized(delta_test, beta_income_test, beta_brand_test, price_vec_test, brand_vec_test, income_test)
-println("\nFirst few market shares (optimized):")
-println(shares_test_optimized[1:3])
-
-# Compare results
-println("\nAre the results approximately equal?")
-println(isapprox(shares_test, shares_test_optimized, rtol=1e-4))
-
-
-
-
-
-function log_likelihood(θ, data, income)
-    δ = θ[1:end-1]  # All but last element are δ
-    β = θ[end]      # Last element is β
-    
-    X = hcat(data.x1, data.x2)  # Assuming x1 and x2 are the product characteristics
-    
-    predicted_shares = market_share(δ, β, X, income.income)
-    observed_shares = data.share
-    
-    return sum(observed_shares .* log.(predicted_shares))
-end
-
-# Calculate and print summary statistics for the OTC Data
-println("Summary Statistics for OTC Data:")
-println(describe(data))
-
-# Calculate and print summary statistics for the Income Data
-println("\nSummary Statistics for Income Data:")
-println(describe(income))
-
-# Print the first few rows of each dataset
-println("\nFirst few rows of OTC Data:")
-println(first(data, 5))
-
-println("\nFirst few rows of Income Data:")
-println(first(income, 5))
-
-# Print the number of unique products and markets
-println("\nNumber of unique products: ", length(unique(data.product)))
-println("Number of unique markets: ", length(unique(data.market)))
-
-# Calculate and print average price and share across all products and markets
-println("\nAverage price across all products and markets: ", mean(data.price))
-println("Average share across all products and markets: ", mean(data.share))
-
-# Calculate and print average income across all markets
-println("\nAverage income across all markets: ", mean(income.income))
-
-println("Hello, World!")
-
-
-
