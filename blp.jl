@@ -48,7 +48,7 @@ PROMOTION_COL = 5
 # Draw the simulated nu values for the empirical integral in the inner loop
 # We draw this first in order to make the code more efficient and not have to redraw random variables in each loop
 # Set the number of draws for the nu variable, this should be a multiple of 20 to align with the observed income distributions
-n_draws = 100
+n_draws = 1000
 nu = randn(n_draws)
 
 
@@ -120,7 +120,7 @@ function delta_contraction_mapping(market_matrix, income_vector, sigma_income, s
 
     # Set a starting value for delta for each product
     delta = zeros(size(market_matrix, 1))
-    delta_new = zeros(size(market_matrix, 1))
+    delta_new = fill(10.0, size(market_matrix, 1))
     predicted_shares = zeros(size(market_matrix, 1))
 
     for iter in 1:max_iter
@@ -264,7 +264,7 @@ function optimize_gmm()
 end
 
 function optimize_gmm_nm()
-    initial_params = [1.0, 1.0]
+    initial_params = [5.0, -10.0]
     
     result = optimize(params -> gmm_objective(params, market_data, income_data, Z),
                       initial_params,
