@@ -1,3 +1,11 @@
+###########################################################
+# BLP Model Estimation for ECO3900
+# By: Anthony McCanny
+# In collaboration and conversation with Samantha Grewal and Jeancarlo Vélez
+# Date: Oct. 6, 2024
+###########################################################
+
+# Load required packages; make sure to add all these packages before running the script
 using CSV, DataFrames, Distributions, LinearAlgebra, BenchmarkTools, Printf, Optim
 
 # Import OTC Data
@@ -120,7 +128,7 @@ function delta_contraction_mapping(market_matrix, income_vector, sigma_income, s
 
     # Set a starting value for delta for each product
     delta = zeros(size(market_matrix, 1))
-    delta_new = fill(10.0, size(market_matrix, 1))
+    delta_new = zeros(size(market_matrix, 1))
     predicted_shares = zeros(size(market_matrix, 1))
 
     for iter in 1:max_iter
@@ -245,27 +253,7 @@ function gmm_objective(params, market_data, income_data, Z)
     return calculate_loss(xi, Z)
 end
 
-# Create instrument matrix
-Z = create_instrument_matrix(market_data)
-
-# Define the optimization problem
-function optimize_gmm()
-    initial_params = [1.0, 1.0]
-    lower_bounds = [-100, -100.0]  # Assuming sigmas should be positive
-    upper_bounds = [100.0, 100.0]  # Set reasonable upper bounds
-    
-    result = optimize(params -> gmm_objective(params, market_data, income_data, Z),
-                      lower_bounds,
-                      upper_bounds,
-                      initial_params,
-                      Fminbox(BFGS()),
-                      Optim.Options(show_trace = true, iterations = 1000))
-    return Optim.minimizer(result)
-end
-
-function optimize_gmm_nm()
-    initial_params = [5.0, -10.0]
-    
+function optimize_gmm(initial_params)
     result = optimize(params -> gmm_objective(params, market_data, income_data, Z),
                       initial_params,
                       NelderMead(),
@@ -274,8 +262,11 @@ function optimize_gmm_nm()
 end
 
 
+# Create instrument matrix
+Z = create_instrument_matrix(market_data)
+
 # Run the optimization
-optimal_params = optimize_gmm_nm()
+optimal_params = optimize_gmm([1.0, 1.0])
 println("Optimal sigma_income: ", optimal_params[1])
 println("Optimal sigma_brand: ", optimal_params[2])
 
@@ -284,3 +275,152 @@ beta_intercept, beta_price, beta_promotion, xi = estimate_demand_parameters(opti
 println("Final Beta Intercept: ", beta_intercept)
 println("Final Beta Price: ", beta_price)
 println("Final Beta Promotion: ", beta_promotion)
+
+# Save estimated values to a CSV file
+results = DataFrame(
+    sigma_income = fill(optimal_params[1], length(xi)),
+    sigma_brand = fill(optimal_params[2], length(xi)),
+    beta_intercept = fill(beta_intercept, length(xi)),
+    beta_price = fill(beta_price, length(xi)),
+    beta_promotion = fill(beta_promotion, length(xi)),
+    xi = xi
+)
+
+CSV.write("blp_estimation_results.csv", results)
+println("Results saved to blp_estimation_results.csv")
+
+# Read the saved results from the CSV file
+saved_results = CSV.read("blp_estimation_results.csv", DataFrame)
+
+# Extract the values from the first row (assuming all rows have the same values)
+sigma_income = saved_results[1, :sigma_income]
+sigma_brand = saved_results[1, :sigma_brand]
+beta_intercept = saved_results[1, :beta_intercept]
+beta_price = saved_results[1, :beta_price]
+beta_promotion = saved_results[1, :beta_promotion]
+xi = saved_results[:, :xi]
+
+println("Restored sigma_income: ", sigma_income)
+println("Restored sigma_brand: ", sigma_brand)
+println("Restored beta_intercept: ", beta_intercept)
+println("Restored beta_price: ", beta_price)
+println("Restored beta_promotion: ", beta_promotion)
+println("Restored xi (first few values): ", xi[1:5])
+
+
+function calculate_market_share_derivatives(market_data, income_data, sigma_income, sigma_brand, beta_intercept, beta_price, beta_promotion, xi, store, week)
+    epsilon = 1e-5  # Small value for central difference
+    
+    
+    # Get data for specific store and week
+    market_data_filtered = market_data[(store, week)]
+    income_vector = income_data[(store, week)]
+    num_products = length(market_data_filtered[:,1])
+    
+    # Calculate the index for the current store and week
+    index_start = (store - 1) * num_weeks * num_products + (week - 1) * num_products + 1
+    index_end = index_start + num_products - 1
+    xi_filtered = xi[index_start:index_end]
+    
+    n_products = size(market_data_filtered, 1)
+    derivatives = zeros(n_products, n_products)
+
+    # Precalculate income_effects and brand_effects
+    income_effects = sigma_income .* income_vector
+    brand_effects = sigma_brand .* nu
+
+    for j in 1:n_products
+        # Create two copies of market_data with slightly different prices for product j
+        market_data_plus = copy(market_data_filtered)
+        market_data_minus = copy(market_data_filtered)
+        
+        market_data_plus[j, PRICE_COL] += epsilon
+        market_data_minus[j, PRICE_COL] -= epsilon
+
+        # Calculate delta for both cases
+        delta_plus = beta_intercept .+ beta_price .* market_data_plus[:, PRICE_COL] .+ 
+                     beta_promotion .* market_data_plus[:, PROMOTION_COL] .+ xi_filtered
+        delta_minus = beta_intercept .+ beta_price .* market_data_minus[:, PRICE_COL] .+ 
+                      beta_promotion .* market_data_minus[:, PROMOTION_COL] .+ xi_filtered
+
+        # Calculate market shares for both cases
+        shares_plus = predicted_market_share(delta_plus, income_effects, brand_effects, 
+                                            market_data_plus[:, PRICE_COL], market_data_plus[:, BRANDED_COL])
+        shares_minus = predicted_market_share(delta_minus, income_effects, brand_effects, 
+                                             market_data_minus[:, PRICE_COL], market_data_minus[:, BRANDED_COL])
+
+        # Calculate derivatives using central difference
+        derivatives[:, j] = (shares_plus - shares_minus) / (2 * epsilon)
+    end
+
+    return derivatives, market_data_filtered
+end
+
+
+# Calculate derivatives and elasticities for the specific store and week
+derivatives, market_data_filtered = calculate_market_share_derivatives(market_data, income_data, sigma_income, sigma_brand, beta_intercept, beta_price, beta_promotion, xi, store_mapping[9], 10)
+
+
+function calculate_elasticities(market_data, derivatives)
+    n_products = size(market_data, 1)
+    elasticities = zeros(n_products, n_products)
+
+    shares = market_data[:, SHARES_COL]
+    prices = market_data[:, PRICE_COL]
+
+    for i in 1:n_products
+        for j in 1:n_products
+            elasticities[i, j] = derivatives[i, j] * prices[j] / shares[i]
+        end
+    end
+
+    return elasticities
+end
+
+elasticities = calculate_elasticities(market_data_filtered, derivatives)
+
+# Print some summary statistics
+println("For Original Store 9 (New Store $(store_mapping[9])), Week 10:")
+println("Mean own-price elasticity: ", mean(diag(elasticities)))
+println("Mean cross-price elasticity: ", (sum(elasticities) - sum(diag(elasticities))) / (size(elasticities, 1)^2 - size(elasticities, 1)))
+
+# Save elasticities to a CSV file
+elasticity_df = DataFrame(elasticities, :auto)
+CSV.write("elasticities_original_store9_week10.csv", elasticity_df)
+println("Elasticities saved to elasticities_original_store9_week10.csv")
+
+# Calculate marginal cost for a monopoly supplier
+function calculate_monopoly_mc(prices, elasticities)
+    n_products = length(prices)
+    mc = zeros(n_products)
+    
+    for i in 1:n_products
+        own_price_elasticity = elasticities[i, i]
+        mc[i] = prices[i] * (1 + 1 / own_price_elasticity)
+    end
+    
+    return mc
+end
+
+# Extract prices for the specific store and week
+prices = market_data_filtered[:, COST_COL]
+
+# Calculate marginal costs
+monopoly_mc = calculate_monopoly_mc(prices, elasticities)
+
+# Print summary statistics
+println("For Original Store 9 (New Store $(store_mapping[9])), Week 10:")
+println("Mean monopoly marginal cost: ", mean(monopoly_mc))
+println("Min monopoly marginal cost: ", minimum(monopoly_mc))
+println("Max monopoly marginal cost: ", maximum(monopoly_mc))
+
+# Create a DataFrame with product information, prices, and marginal costs
+mc_df = DataFrame(
+    Product = 1:length(prices),
+    Wholesale_Cost = prices,
+    Marginal_Cost = monopoly_mc
+)
+
+# Save the DataFrame to a CSV file
+CSV.write("monopoly_mc_original_store9_week10.csv", mc_df)
+println("Monopoly marginal costs saved to monopoly_mc_original_store9_week10.csv")
